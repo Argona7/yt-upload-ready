@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_DIR="$PROJECT_DIR/.venv"
+STAMP_FILE="$VENV_DIR/.yt-dlp-updated"
+DOWNLOAD_DIR="${YT_DOWNLOAD_DIR:-$HOME/Downloads}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+COOKIES_BROWSER="${YT_COOKIES_BROWSER:-auto}"
+TARGET_MAX_WIDTH="${YT_TARGET_MAX_WIDTH:-1280}"
+TARGET_MAX_HEIGHT="${YT_TARGET_MAX_HEIGHT:-720}"
+TARGET_VIDEO_BITRATE="${YT_TARGET_VIDEO_BITRATE:-1000k}"
+TARGET_VIDEO_MAXRATE="${YT_TARGET_VIDEO_MAXRATE:-1500k}"
+TARGET_VIDEO_BUFSIZE="${YT_TARGET_VIDEO_BUFSIZE:-3000k}"
+TARGET_AUDIO_BITRATE="${YT_TARGET_AUDIO_BITRATE:-96k}"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  yt "https://www.youtube.com/watch?v=..."
+  yt "https://www.youtube.com/shorts/..."
+
+By default files are saved to ~/Downloads.
+Set YT_DOWNLOAD_DIR to choose another folder.
+USAGE
+}
+
+die() {
+  printf 'yt: %s\n' "$*" >&2
+  exit 1
+}
+
+ensure_tools() {
+  command -v "$PYTHON_BIN" >/dev/null 2>&1 || die "python3 is not installed or is not in PATH"
+
+  if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+    "$PYTHON_BIN" -m venv "$VENV_DIR"
+  fi
+
+  local needs_update=0
+  if [[ ! -x "$VENV_DIR/bin/yt-dlp" ]]; then
+    needs_update=1
+  elif [[ ! -f "$STAMP_FILE" ]]; then
+    needs_update=1
+  elif [[ -n "$(find "$STAMP_FILE" -mtime +7 -print 2>/dev/null)" ]]; then
+    needs_update=1
+  fi
+
+  if [[ "$needs_update" == "1" ]]; then
+    printf 'yt: installing/updating yt-dlp...\n' >&2
+    "$VENV_DIR/bin/python" -m pip install --upgrade pip yt-dlp >/dev/null
+    touch "$STAMP_FILE"
+  fi
+}
+
+add_js_runtime() {
+  if command -v node >/dev/null 2>&1; then
+    args+=(--js-runtimes "node:$(command -v node)")
+  elif command -v bun >/dev/null 2>&1; then
+    args+=(--js-runtimes "bun:$(command -v bun)")
+  elif command -v deno >/dev/null 2>&1; then
+    args+=(--js-runtimes "deno:$(command -v deno)")
+  fi
+}
+
+add_browser_cookies() {
+  case "$COOKIES_BROWSER" in
+    none|off|false|0)
+      return
+      ;;
+    auto)
+      if [[ -d "$HOME/Library/Application Support/Google/Chrome" ]]; then
+        args+=(--cookies-from-browser chrome)
+      elif [[ -d "$HOME/Library/Application Support/BraveSoftware/Brave-Browser" ]]; then
+        args+=(--cookies-from-browser brave)
+      elif [[ -d "$HOME/Library/Application Support/Firefox/Profiles" ]]; then
+        args+=(--cookies-from-browser firefox)
+      elif [[ -d "$HOME/Library/Safari" ]]; then
+        args+=(--cookies-from-browser safari)
+      fi
+      ;;
+    *)
+      args+=(--cookies-from-browser "$COOKIES_BROWSER")
+      ;;
+  esac
+}
+
+has_ffmpeg_encoder() {
+  local encoder="$1"
+  ffmpeg -hide_banner -encoders 2>/dev/null | grep -q "[[:space:]]$encoder[[:space:]]"
+}
+
+convert_to_upload_mp4() {
+  local input="$1"
+  [[ -f "$input" ]] || die "downloaded file was not found: $input"
+  command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg is required to convert videos for upload"
+
+  local final="${input%.*}.mp4"
+  local tmp="${final%.*}.upload-tmp.$$.$RANDOM.mp4"
+  local scale_filter="scale='if(gt(a,16/9),min($TARGET_MAX_WIDTH,iw),-2)':'if(gt(a,16/9),-2,min($TARGET_MAX_HEIGHT,ih))':flags=lanczos,fps=30,format=yuv420p"
+  local -a video_args
+
+  if has_ffmpeg_encoder h264_videotoolbox; then
+    video_args=(-c:v h264_videotoolbox -profile:v high -b:v "$TARGET_VIDEO_BITRATE" -maxrate "$TARGET_VIDEO_MAXRATE" -bufsize "$TARGET_VIDEO_BUFSIZE")
+  else
+    video_args=(-c:v libx264 -preset medium -profile:v high -crf 23 -maxrate 5000k -bufsize 10000k)
+  fi
+
+  printf 'yt: converting to upload-compatible MP4 (H.264/AAC, max %sx%s, 30 fps)...\n' "$TARGET_MAX_WIDTH" "$TARGET_MAX_HEIGHT" >&2
+  if ! ffmpeg -hide_banner -stats -y \
+    -i "$input" \
+    -vf "$scale_filter" \
+    "${video_args[@]}" \
+    -pix_fmt yuv420p \
+    -tag:v avc1 \
+    -c:a aac \
+    -b:a "$TARGET_AUDIO_BITRATE" \
+    -ar 48000 \
+    -ac 2 \
+    -movflags +faststart \
+    "$tmp"; then
+    rm -f "$tmp"
+    die "ffmpeg conversion failed"
+  fi
+
+  mv -f "$tmp" "$final"
+  if [[ "$input" != "$final" ]]; then
+    rm -f "$input"
+  fi
+
+  printf 'yt: ready for upload: %s\n' "$final" >&2
+}
+
+main() {
+  if [[ $# -lt 1 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
+  fi
+
+  local url="$1"
+  shift
+
+  ensure_tools
+  mkdir -p "$DOWNLOAD_DIR"
+  command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg is required for upload-compatible video conversion"
+
+  local downloaded_paths
+  downloaded_paths="$(mktemp "${TMPDIR:-/tmp}/yt-downloaded.XXXXXX")"
+
+  local -a args=(
+    --ignore-config
+    --no-playlist
+    --continue
+    --no-mtime
+    --newline
+    --windows-filenames
+    --trim-filenames 180
+    --retries 10
+    --fragment-retries 10
+    --retry-sleep fragment:exp=1:20
+    --concurrent-fragments 4
+    --remote-components ejs:github
+    -P "$DOWNLOAD_DIR"
+    -o "%(title).180B.%(ext)s"
+    --print-to-file "after_move:filepath" "$downloaded_paths"
+  )
+
+  add_js_runtime
+  add_browser_cookies
+
+  args+=(
+    --format "bv*[vcodec^=avc1][height<=?$TARGET_MAX_HEIGHT][fps<=?30]+ba[acodec^=mp4a]/bv*[height<=?$TARGET_MAX_HEIGHT][fps<=?30]+ba/b[ext=mp4][height<=?$TARGET_MAX_HEIGHT][fps<=?30]/b"
+    --merge-output-format mp4
+  )
+
+  if ! "$VENV_DIR/bin/yt-dlp" "${args[@]}" "$@" "$url"; then
+    rm -f "$downloaded_paths"
+    exit 1
+  fi
+
+  while IFS= read -r downloaded_path; do
+    [[ -n "$downloaded_path" ]] || continue
+    convert_to_upload_mp4 "$downloaded_path"
+  done < "$downloaded_paths"
+
+  rm -f "$downloaded_paths"
+}
+
+main "$@"
