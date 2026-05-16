@@ -129,6 +129,25 @@ convert_to_upload_mp4() {
   fi
 
   printf 'yt: ready for upload: %s\n' "$final" >&2
+  printf '%s\n' "$final"
+}
+
+copy_files_to_clipboard() {
+  [[ "$(uname)" == "Darwin" ]] || return 0
+  [[ $# -gt 0 ]] || return 0
+
+  local items=""
+  local p
+  for p in "$@"; do
+    [[ -n "$items" ]] && items+=", "
+    items+="POSIX file \"$p\""
+  done
+
+  if [[ $# -eq 1 ]]; then
+    osascript -e "set the clipboard to POSIX file \"$1\"" >/dev/null 2>&1 || true
+  else
+    osascript -e "set the clipboard to {$items}" >/dev/null 2>&1 || true
+  fi
 }
 
 main() {
@@ -178,12 +197,28 @@ main() {
     exit 1
   fi
 
+  local -a final_paths=()
+  local downloaded_path final_path
   while IFS= read -r downloaded_path; do
     [[ -n "$downloaded_path" ]] || continue
-    convert_to_upload_mp4 "$downloaded_path"
+    final_path="$(convert_to_upload_mp4 "$downloaded_path")"
+    [[ -n "$final_path" ]] && final_paths+=("$final_path")
   done < "$downloaded_paths"
 
   rm -f "$downloaded_paths"
+
+  if [[ ${#final_paths[@]} -gt 0 ]]; then
+    printf '\nyt: saved:\n' >&2
+    local p
+    for p in "${final_paths[@]}"; do
+      printf '  ✓ %s\n' "$p" >&2
+    done
+    copy_files_to_clipboard "${final_paths[@]}"
+    if [[ "$(uname)" == "Darwin" ]]; then
+      printf '📋 copied to clipboard (%d file%s)\n' "${#final_paths[@]}" \
+        "$([[ ${#final_paths[@]} -gt 1 ]] && printf 's')" >&2
+    fi
+  fi
 }
 
 main "$@"
